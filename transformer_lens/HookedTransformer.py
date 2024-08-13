@@ -663,8 +663,9 @@ class HookedTransformer(HookedRootModule):
         # tokenizers like LlamaTokenizer are different when bos token is automatically/manually
         # prepended, and add_bos_token cannot be dynamically controlled after initialization
         # (https://github.com/huggingface/transformers/issues/25886).
-        tokenizer_with_bos = utils.get_tokenizer_with_bos(tokenizer)
-        self.tokenizer = tokenizer_with_bos
+        # tokenizer_with_bos = utils.get_tokenizer_with_bos(tokenizer)
+        # self.tokenizer = tokenizer_with_bos
+        self.tokenizer = tokenizer
         assert self.tokenizer is not None  # keep mypy happy
         self.tokenizer.padding_side = default_padding_side
 

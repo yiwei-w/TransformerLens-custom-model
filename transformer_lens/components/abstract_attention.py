@@ -203,10 +203,12 @@ class AbstractAttention(ABC, nn.Module):
             kv_cache_pos_offset = 0
 
         if self.cfg.positional_embedding_type == "rotary":
-            q = self.hook_rot_q(self.apply_rotary(q, kv_cache_pos_offset, attention_mask))
-            k = self.hook_rot_k(
-                self.apply_rotary(k, 0, attention_mask)
-            )  # keys are cached so no offset
+            assert self.cfg.rotary_dim is not None, "Rotary dim must be provided for rotary positional embeddings"
+            freqs_cis = self.calculate_freqs_cis(dim=self.cfg.rotary_dim, end=self.cfg.n_ctx, base=self.cfg.rotary_base)
+            xq, xk = self.apply_rotary_emb(q, k, freqs_cis)
+            q = self.hook_rot_q(xq)
+            k = self.hook_rot_k(xk)
+            # keys are cached so no offset
 
         if self.cfg.dtype not in [torch.float32, torch.float64]:
             # If using 16 bits, increase the precision to avoid numerical instabilities
@@ -537,6 +539,39 @@ class AbstractAttention(ABC, nn.Module):
             x_rotated = x_rot * mask_rotary_cos + x_flip * mask_rotary_sin
 
         return torch.cat([x_rotated, x_pass], dim=-1)
+    
+    def calculate_freqs_cis(self, dim: int, end: int, base: float = 10000.0):
+        freqs = 1.0 / (base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+        t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+        freqs = torch.outer(t, freqs)
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+        return freqs_cis
+
+    def reshape_for_broadcast(self, freqs_cis: torch.Tensor, x: torch.Tensor):
+        ndim = x.ndim
+        assert 0 <= 1 < ndim
+        assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+        shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+        return freqs_cis.view(*shape)
+
+
+    def apply_rotary_emb(
+        self,
+        xq: torch.Tensor,
+        xk: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ):
+        # xq and xk have shape (batch_size, seq_len, num_heads, head_dim)
+        # print("xq.shape", xq.shape)
+        # print("xk.shape", xk.shape)
+        # print("freqs_cis.shape", freqs_cis.shape)
+        freqs_cis = freqs_cis[:xq.shape[1]]
+        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+        freqs_cis = self.reshape_for_broadcast(freqs_cis, xq_)
+        xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+        xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+        return xq_out.type_as(xq), xk_out.type_as(xk)
 
     @staticmethod
     def create_alibi_slope(

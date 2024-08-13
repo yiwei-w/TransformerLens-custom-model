@@ -27,6 +27,7 @@ from transformer_lens.pretrained.weight_conversions import (
     convert_bloom_weights,
     convert_coder_weights,
     convert_gemma_weights,
+    convert_gpt2_rope_weights,
     convert_gpt2_weights,
     convert_gptj_weights,
     convert_llama_weights,
@@ -43,6 +44,8 @@ from transformer_lens.pretrained.weight_conversions import (
     convert_qwen_weights,
     convert_t5_weights,
 )
+
+CUSTOM_MODEL_NAME = "custom/gpt2-rope"
 
 OFFICIAL_MODEL_NAMES = [
     "gpt2",
@@ -218,6 +221,7 @@ OFFICIAL_MODEL_NAMES = [
     "google-t5/t5-base",
     "google-t5/t5-large",
     "ai-forever/mGPT",
+    CUSTOM_MODEL_NAME,
 ]
 """Official model names for models on HuggingFace."""
 
@@ -683,6 +687,8 @@ def get_official_model_name(model_name: str):
     """
     Returns the official model name for a given model name (or alias).
     """
+    if model_name.endswith(".pt") and Path(model_name).exists():
+        return model_name
     model_alias_map = make_model_alias_map()
     official_model_name = model_alias_map.get(model_name.lower(), None)
     if official_model_name is None:
@@ -1391,10 +1397,33 @@ def get_pretrained_model_config(
             Also given to other HuggingFace functions when compatible.
 
     """
-    if Path(model_name).exists():
+    if model_name.endswith(".pt") and Path(model_name).exists():
         # If the model_name is a path, it's a local model
-        cfg_dict = convert_hf_model_config(model_name, **kwargs)
-        official_model_name = model_name
+        # Ad-hoc patch for my custom model
+        # Custom model config dict
+        official_model_name = CUSTOM_MODEL_NAME
+        cfg_dict = {
+            "d_model": 512,
+            "d_head": 64,
+            "n_heads": 8,
+            "d_mlp": 512 * 4,
+            "n_layers": 12,
+            "n_ctx": 72,
+            "eps": 1e-5,
+            "d_vocab": 80,
+            "act_fn": "gelu",
+            "use_attn_scale": True,
+            "use_local_attn": False,
+            "scale_attn_by_inverse_layer_idx": False,
+            "parallel_attn_mlp": False,
+            "positional_embedding_type": "rotary",
+            "rotary_base": 10000.0,
+            "rotary_dim": 64,
+            # GPTNeoX style by folding the full length in half, and then looking at pairs accordingly
+            "rotary_adjacent_pairs": False,
+            "normalization_type": "LN",
+        }
+
     else:
         official_model_name = get_official_model_name(model_name)
     if (
@@ -1403,15 +1432,15 @@ def get_pretrained_model_config(
         or official_model_name.startswith("Baidicoot")
     ):
         cfg_dict = convert_neel_model_config(official_model_name, **kwargs)
-    else:
-        if official_model_name.startswith(NEED_REMOTE_CODE_MODELS) and not kwargs.get(
-            "trust_remote_code", False
-        ):
-            logging.warning(
-                f"Loading model {official_model_name} requires setting trust_remote_code=True"
-            )
-            kwargs["trust_remote_code"] = True
-        cfg_dict = convert_hf_model_config(official_model_name, **kwargs)
+    # else:
+    #     if official_model_name.startswith(NEED_REMOTE_CODE_MODELS) and not kwargs.get(
+    #         "trust_remote_code", False
+    #     ):
+    #         logging.warning(
+    #             f"Loading model {official_model_name} requires setting trust_remote_code=True"
+    #         )
+    #         kwargs["trust_remote_code"] = True
+    #     cfg_dict = convert_hf_model_config(official_model_name, **kwargs)
     # Processing common to both model types
     # Remove any prefix, saying the organization who made a model.
     cfg_dict["model_name"] = official_model_name.split("/")[-1]
@@ -1555,6 +1584,7 @@ def get_pretrained_state_dict(
     if Path(official_model_name).exists():
         official_model_name = str(Path(official_model_name).resolve())
         logging.info(f"Loading model from local path {official_model_name}")
+        # Using official_model_name as path to model
     else:
         official_model_name = get_official_model_name(official_model_name)
     if official_model_name.startswith(NEED_REMOTE_CODE_MODELS) and not kwargs.get(
@@ -1611,7 +1641,7 @@ def get_pretrained_state_dict(
                 )
             else:
                 raise ValueError(f"Checkpoints for model {official_model_name} are not supported")
-        elif hf_model is None:
+        elif hf_model is None and not official_model_name.endswith(".pt"):
             huggingface_token = os.environ.get("HF_TOKEN", None)
             if official_model_name in NON_HF_HOSTED_MODEL_NAMES:
                 raise NotImplementedError("Model not hosted on HuggingFace, must pass in hf_model")
@@ -1639,10 +1669,12 @@ def get_pretrained_state_dict(
 
             # Load model weights, and fold in layer norm weights
 
-        for param in hf_model.parameters():
-            param.requires_grad = False
+        # for param in hf_model.parameters():
+        #     param.requires_grad = False
 
-        if cfg.original_architecture == "GPT2LMHeadModel":
+        if official_model_name.endswith(".pt"):
+            state_dict = convert_gpt2_rope_weights(official_model_name, cfg)
+        elif cfg.original_architecture == "GPT2LMHeadModel":
             state_dict = convert_gpt2_weights(hf_model, cfg)
         elif cfg.original_architecture == "GPTNeoForCausalLM":
             state_dict = convert_neo_weights(hf_model, cfg)
